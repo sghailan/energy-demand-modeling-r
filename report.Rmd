@@ -1,0 +1,681 @@
+---
+title: ''
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: false
+    number_sections: false
+  html_document:
+    toc: true
+    df_print: paged
+  word_document:
+    toc: true
+geometry: margin=2.5cm
+header-includes:
+- \usepackage{graphicx}
+- \usepackage{float}
+- \renewcommand{\contentsname}{Contenidos}
+---
+
+\pagenumbering{gobble}
+\thispagestyle{empty}
+
+\begin{center}
+\vspace*{1cm}
+\end{center}
+
+\vspace{2.2cm}
+
+\begin{center}
+{\Huge \textbf{Pronosticar con inteligencia}}\\[0.9cm]
+
+{\Large Diagnóstico inicial de un modelo predictivo de demanda energética}\\[2.0cm]
+
+{\large Informe técnico para su implementación en}\\[0.3cm]
+{\Large \textbf{IBM Planning Analytics}}
+\end{center}
+
+\vfill
+
+\begin{center}
+\begin{tabular}{rl}
+\textbf{Asignatura:} & Matemáticas Aplicadas a la Inteligencia Artificial \\
+\textbf{Autora:} & Salma Ghailan Serroukh \\
+\textbf{Fecha:} & `r format(Sys.Date(), '%d/%m/%Y')` \\
+\end{tabular}
+\end{center}
+
+\newpage
+\pagenumbering{arabic}
+\tableofcontents
+\newpage
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+echo = TRUE, warning = FALSE, message = FALSE,
+fig.pos = "H", fig.width = 6.3, fig.height = 3.2
+)
+# librerias usadas
+library(leaps)
+library(DAAG)
+library(olsrr)
+library(readr)
+library(car)        
+library(lmtest) 
+library(glmnet)
+```
+
+
+# Introducción
+
+Este trabajo presenta un diagnóstico inicial de un modelo de predicción de la demanda energética, orientado a su futura implementación en IBM Planning Analytics. El análisis se apoya en datos históricos que combinan variables climáticas, económicas y de consumo, con el objetivo de identificar los factores más relevantes en la estimación de la demanda y evaluar distintos enfoques de modelización.
+
+Para el análisis exploratorio y la visualización detallada de los resultados, se utiliza la siguiente aplicación interactiva:
+
+<https://salmagsdata.shinyapps.io/demanda-energetica/>
+
+# Exploración inicial de los datos
+
+Esta fase tiene como objetivo verificar la calidad y consistencia del conjunto de datos, analizando su estructura general y la presencia de valores faltantes o atípicos, con el fin de garantizar la fiabilidad del posterior análisis predictivo.
+
+## Carga de los datos
+
+El conjunto de datos se carga y revisa para confirmar la correcta importación de las variables y la ausencia de transformaciones automáticas no deseadas.
+
+```{r}
+df_demanda <- read.csv("data/datos.csv", stringsAsFactors = FALSE)
+head(df_demanda, 1)
+```
+
+## Vista preliminar del conjunto de datos
+
+El conjunto de datos está compuesto por 200 observaciones correspondientes a distintos períodos temporales y 6 variables de carácter cuantitativo continuo. Estas variables se agrupan en tres bloques principales: climáticas, económicas y energéticas, que recogen información relevante para el análisis de la demanda energética.
+
+```{r}
+dim(df_demanda)
+colnames(df_demanda)
+```
+
+## Verificación básica de integridad de los datos
+
+Se realizó una comprobación básica de la integridad del conjunto de datos, analizando la presencia de valores faltantes y registros duplicados. No se detectaron incidencias relevantes, por lo que los datos se consideran adecuados para el análisis posterior.
+
+```{r}
+colSums(is.na(df_demanda))
+sum(duplicated(df_demanda))
+```
+
+
+## Análisis univariante de los datos
+
+Se realizó un análisis univariante de las variables con el objetivo de evaluar su escala, dispersión y coherencia estadística. Los estadísticos descriptivos y la inspección visual de las distribuciones indican que las variables presentan rangos coherentes con su interpretación climática, económica y energética, sin valores extremos incompatibles ni asimetrías severas.
+
+```{r, echo=FALSE, results="hide"}
+summary(df_demanda)
+```
+
+En consecuencia, no se considera necesaria la aplicación de transformaciones previas de las variables para la fase de modelización.
+
+## Análisis bivariante de los datos
+
+Con el objetivo de explorar la relación entre la demanda energética y las variables explicativas, se llevó a cabo un análisis bivariante basado en medidas de correlación y en la inspección visual de las relaciones entre pares de variables. 
+
+```{r, echo=FALSE}
+cor_mat <- round(cor(df_demanda), 2)
+cor_demanda <- cor_mat["demanda_energia", ]
+knitr::kable(
+  cor_demanda[-which(names(cor_demanda) == "demanda_energia")],
+  col.names = "Correlación con demanda energética"
+)
+```
+
+Los resultados muestran que la temperatura media presenta una correlación negativa fuerte con la demanda energética, mientras que el consumo histórico exhibe una relación positiva de magnitud moderada. Por su parte, el desempleo mantiene una asociación negativa débil, y las variables económicas restantes no evidencian relaciones lineales significativas de forma aislada.
+
+El análisis visual detallado mediante diagramas de dispersión y la matriz completa de correlaciones se encuentran disponibles en la aplicación interactiva desarrollada para este trabajo, que permite explorar de forma dinámica las relaciones entre variables: <https://salmagsdata.shinyapps.io/demanda-energetica/>
+
+En conjunto, estos resultados respaldan la selección de variables climáticas y energéticas como principales determinantes de la demanda, que se consideran candidatas prioritarias para la fase de modelización multivariada.
+
+```{r}
+mod_sel_1 <- lm(demanda_energia ~ temperatura_media + consumo_historico + desempleo,
+                data = df_demanda)
+# summary(mod_sel_1)
+```
+
+# Selección de variables
+
+La selección de variables es un paso clave para construir modelos predictivos estables e interpretables. Desde una perspectiva multivariante, se evalúa la contribución conjunta de los predictores mediante criterios estadísticos que penalizan la complejidad del modelo, con el objetivo de identificar especificaciones parsimoniosas.
+
+## Búsqueda exhaustiva de modelos
+
+La selección de variables se realiza mediante una búsqueda exhaustiva que evalúa todas las combinaciones posibles de predictores, permitiendo comparar modelos de distinta complejidad y seleccionar aquellos con mejor compromiso entre ajuste y simplicidad.
+
+```{r}
+reg.fit.exh <- regsubsets(
+demanda_energia ~ temperatura_media + gasto_consumidor + inflacion +
+desempleo + consumo_historico, data = df_demanda, nvmax = 5,
+method = "exhaustive")
+summary(reg.fit.exh)
+```
+
+| Número de variables | Variables seleccionadas                                                      |
+| ------------------- | ---------------------------------------------------------------------------- |
+| 1                   | temperatura_media                                                            |
+| 2                   | temperatura_media, consumo_historico                                         |
+| 3                   | temperatura_media, gasto_consumidor, consumo_historico                       |
+| 4                   | temperatura_media, gasto_consumidor, desempleo, consumo_historico            |
+| 5                   | temperatura_media, gasto_consumidor, inflacion, desempleo, consumo_historico |
+
+Los resultados muestran que la temperatura media está presente en todos los modelos seleccionados, confirmando su papel como principal determinante de la demanda energética. Asimismo, el consumo histórico aparece de forma consistente desde los modelos de menor complejidad. Las variables económicas se incorporan progresivamente a medida que aumenta el número de covariables, lo que sugiere un efecto complementario sobre la demanda.
+
+### Evaluación mediante $R^2$ y $R^2$ ajustado
+
+Para evaluar el compromiso entre capacidad explicativa y complejidad del modelo, se analizó la evolución del coeficiente de determinación ($R^2$) y del $R^2$ ajustado en función del número de variables incluidas.
+
+```{r, echo=FALSE, results="hide"}
+reg.summary <- summary(reg.fit.exh)
+reg.summary$rsq
+
+reg.summary$adjr2
+which.max(reg.summary$adjr2)
+```
+```{r, echo=FALSE}
+par(mfrow=c(1,2))
+plot(reg.summary$rss ,xlab="Numero de variables ",ylab="RSS",
+     type="l")
+plot(reg.summary$adjr2 ,xlab="Numero de variables ",
+     ylab="Adjusted RSq",type="l")
+points(5,reg.summary$adjr2[5], col="red",cex=2,pch=20)
+```
+
+Los resultados muestran que, a partir de tres variables, las mejoras en el ajuste son cada vez más reducidas. Aunque el $R^2$ ajustado alcanza su valor máximo en el modelo con cinco variables, la ganancia respecto al modelo con cuatro variables es marginal.
+
+En consecuencia, se adopta un criterio de parsimonia y se selecciona el modelo con cuatro covariables, que ofrece un ajuste muy similar con menor complejidad y mayor interpretabilidad.
+
+```{r}
+mod_sel_2 <- lm(
+demanda_energia ~ temperatura_media + gasto_consumidor + desempleo +
+  consumo_historico, data = df_demanda)
+# summary(mod_sel_2)
+```
+
+### Evaluación mediante $C_p$
+
+Como criterio adicional de selección, se analizó el estadístico $C_p$ de Mallows, que permite evaluar el equilibrio entre error de ajuste y complejidad del modelo.
+
+```{r, echo=FALSE, results="hide"}
+reg.summary$cp
+which.min(reg.summary$cp)
+```
+
+Los resultados muestran que el valor mínimo de $C_p$ se alcanza en el modelo que incluye todas las variables explicativas disponibles.
+ 
+```{r}
+mod_sel_3 <- lm(
+demanda_energia ~ temperatura_media + gasto_consumidor +
+inflacion + desempleo + consumo_historico, data = df_demanda)
+# summary(mod_sel_3)
+```
+
+### Evaluación mediante BIC
+
+Como criterio de selección, se analizó el BIC (Bayesian Information Criterion), que penaliza de forma más severa la complejidad del modelo. Los resultados indican que el valor mínimo de BIC se alcanza en el modelo que incluye todas las variables explicativas disponibles.
+
+```{r, echo=FALSE, results='hide'}
+reg.summary$bic
+which.min(reg.summary$bic)
+```
+
+```{r criterio Cp 2, echo=FALSE}
+par(mfrow=c(1,2))
+plot(reg.summary$cp ,xlab="Numero de variables ",ylab="Cp", type="l")
+points(5,reg.summary$cp [5],col="red",cex=2,pch=20)
+plot(reg.summary$bic, xlab = "Número de variables",
+ylab = "BIC", type = "l")
+points(5, reg.summary$bic[5], col = "red", cex = 2, pch = 20)
+```
+
+## Búsqueda mediante paso a paso hacia adelante de modelos
+
+Como alternativa a la búsqueda exhaustiva, se aplicó el método de selección paso a paso hacia adelante (forward selection), que construye el modelo de forma progresiva incorporando en cada iteración la variable que mayor mejora aporta al ajuste.
+
+```{r}
+reg.fit.forward <- regsubsets(
+  demanda_energia ~ temperatura_media + gasto_consumidor + inflacion +
+  desempleo + consumo_historico, data = df_demanda,
+  method = "forward", nvmax = 5)
+reg.summary.forward <- summary(reg.fit.forward)
+```
+
+```{r forward selection valores de los criterios, echo=FALSE, results='hide'}
+#Estadisticos R^2:
+reg.summary.forward$rsq
+
+#Estadisticos R^2 ajustado:
+reg.summary.forward$adjr2
+which.max(reg.summary.forward$adjr2)
+
+
+#Estadisticos Cp ajustado:
+reg.summary.forward$cp
+which.min(reg.summary.forward$cp)
+
+#Estadisticos bic
+reg.summary.forward$bic
+which.min(reg.summary.forward$bic)
+```
+
+Los resultados obtenidos muestran que la secuencia de variables seleccionadas y los modelos óptimos identificados mediante forward selection coinciden con los obtenidos mediante búsqueda exhaustiva. En particular, los criterios $R^2$ ajustado, $C_p$ y BIC señalan nuevamente al modelo con cinco variables como el de mejor ajuste global.
+
+No obstante, al igual que en el análisis previo, la mejora obtenida respecto al modelo con cuatro covariables es marginal. En consecuencia, y priorizando la parsimonia y la interpretabilidad, se mantiene la selección del modelo con cuatro variables como especificación final.
+
+| Criterio | Búsqueda exhaustiva | Forward selection |
+|--------|---------------------|------------------|
+| \(R^2\) ajustado | Modelo con 5 variables | Modelo con 5 variables |
+| \(C_p\) | Modelo con 5 variables | Modelo con 5 variables |
+| BIC | Modelo con 5 variables | Modelo con 5 variables |
+
+# Modelos candidatos
+
+A partir del análisis exploratorio y de los distintos criterios de selección, se consideran tres modelos candidatos que permiten evaluar el compromiso entre capacidad explicativa y complejidad.
+
+```{r, echo=FALSE, results='hide'}
+summary(mod_sel_1)
+summary(mod_sel_2)
+summary(mod_sel_3)
+```
+
+| Modelo | Nº variables | Variables incluidas | $R^2$ ajustado | Comentario |
+|------|-------------|---------------------|---------------|------------|
+| Base | 3 | temperatura_media, consumo_historico, desempleo | 0.853 | Modelo simple e interpretable |
+| Intermedio | 4 | temperatura_media, gasto_consumidor, desempleo, consumo_historico | 0.9039 | Mejora sustancial del ajuste |
+| Completo | 5 | temperatura_media, gasto_consumidor, inflacion, desempleo, consumo_historico | 0.9068 | Mejora marginal |
+
+La comparación muestra que el modelo de cuatro variables ofrece un equilibrio óptimo entre capacidad explicativa y complejidad. Aunque el modelo completo maximiza el ajuste, la ganancia adicional es reducida, por lo que la decisión final se abordará en la fase de validación predictiva.
+
+## Validación cruzada
+
+La capacidad predictiva de los modelos candidatos se evaluó mediante validación cruzada de 5 particiones, utilizando el error cuadrático medio (MSE) como métrica de comparación.
+
+```{r, echo=TRUE, results="hide", fig.show="hide"}
+cv_mod_3 <- cv.lm(data = df_demanda,m = 5,form.lm = mod_sel_1,seed = 123)
+cv_mod_4 <- cv.lm(data = df_demanda,m = 5,form.lm = mod_sel_2,seed = 123)
+cv_mod_5 <- cv.lm(data = df_demanda,m = 5,form.lm = mod_sel_3,seed = 123)
+mse_mod_3 <- mean((cv_mod_3$cvpred - df_demanda$demanda_energia)^2, na.rm = TRUE)
+mse_mod_4 <- mean((cv_mod_4$cvpred - df_demanda$demanda_energia)^2, na.rm = TRUE)
+mse_mod_5 <- mean((cv_mod_5$cvpred - df_demanda$demanda_energia)^2, na.rm = TRUE)
+AIC(mod_sel_1,mod_sel_2,mod_sel_3)
+BIC(mod_sel_1,mod_sel_2,mod_sel_3)
+```
+
+| Modelo | Nº variables | MSE (5-fold CV) | AIC | BIC | Comentario |
+|------|-------------|----------------:|----:|----:|------------|
+| Base | 3 | 70 966 | 2796.02 | 2812.51 | Ajuste limitado |
+| Intermedio | 4 | 45 834 | 2712.06 | 2731.85 | Buen equilibrio |
+| Completo | 5 | 44 753 | 2706.79 | 2729.88 | Mejora marginal |
+
+La comparación de los modelos mediante validación cruzada y criterios de información confirma que el modelo completo presenta los valores mínimos de AIC, BIC y MSE. No obstante, las mejoras respecto al modelo intermedio son reducidas. En consecuencia, se selecciona el modelo de cuatro variables como especificación final, al ofrecer un compromiso más favorable entre capacidad predictiva, parsimonia e interpretabilidad.
+
+# Interpretación del modelo seleccionado
+
+El modelo seleccionado es una regresión lineal múltiple que explica la demanda energética a partir de cuatro variables: temperatura media, gasto del consumidor, tasa de desempleo y consumo histórico. Su elección responde a un equilibrio favorable entre capacidad predictiva, parsimonia e interpretabilidad, de acuerdo con los análisis de selección de variables, validación cruzada y criterios de información desarrollados a lo largo del informe.
+
+```{r, results='hide'}
+modelo_demanda <- lm(demanda_energia ~ temperatura_media + gasto_consumidor +
+    desempleo + consumo_historico, data = df_demanda)
+summary(modelo_demanda)
+```
+
+El modelo presenta un ajuste elevado y estadísticamente significativo, lo que indica que el conjunto de variables explicativas aporta información relevante para la explicación de la demanda energética sin recurrir a una complejidad innecesaria.
+
+## Formulación y coeficientes del modelo 
+
+El modelo de regresión lineal múltiple estimado puede expresarse como:
+
+$$
+\text{demanda\_energia} =
+5368.89
+- 103.03 \cdot \text{temperatura\_media}
++ 0.78 \cdot \text{gasto\_consumidor}
+- 72.48 \cdot \text{desempleo}
++ 0.53 \cdot \text{consumo\_historico}
++ \varepsilon
+$$
+
+donde $\varepsilon$ representa el término de error aleatorio.
+
+```{r}
+modelo_demanda$coefficients
+```
+
+Los signos y magnitudes de los coeficientes estimados son coherentes con la interpretación económica y energética del fenómeno analizado. La temperatura media presenta un efecto negativo dominante, reflejando la reducción de la demanda energética asociada a menores necesidades de calefacción en periodos más cálidos.
+
+El consumo histórico muestra un efecto positivo fuerte, confirmando la persistencia de los patrones de consumo energético en el tiempo. Las variables económicas presentan un papel complementario: el gasto del consumidor se asocia positivamente con la demanda, mientras que la tasa de desempleo presenta una relación negativa, consistente con escenarios de menor actividad económica
+
+```{r, results='hide'}
+summary(modelo_demanda)$coef
+confint(modelo_demanda,level=0.98)
+```
+
+Los coeficientes estimados resultan estadísticamente significativos y estables. Los intervalos de confianza obtenidos no incluyen el valor cero, incluso bajo niveles de confianza elevados, lo que refuerza la robustez de las estimaciones y la relevancia individual de cada predictor.
+
+## Interpretación de las variables en el contexto empresarial
+
+Desde una perspectiva empresarial, el modelo integra de forma coherente factores climáticos, económicos y de comportamiento del consumo. La temperatura media condiciona directamente la planificación de la oferta energética y la gestión de costes operativos. El consumo histórico actúa como un indicador de estabilidad y continuidad de la actividad productiva, siendo clave para la previsión de la demanda futura.
+
+Las variables económicas aportan información contextual relevante. Un mayor gasto del consumidor refleja un entorno de mayor actividad económica y uso intensivo de energía, mientras que un aumento del desempleo se asocia a una contracción de la demanda energética. En conjunto, el modelo permite vincular la previsión energética con decisiones empresariales de planificación, asignación de recursos y análisis de escenarios.
+
+## Calidad global del ajuste
+
+En términos de calidad de ajuste, el modelo presenta valores elevados de \(R^2\) y \(R^2\) ajustado, superiores al 90 %, lo que indica que el modelo explica una proporción muy elevada de la variabilidad observada en la demanda energética.
+
+Además, el error estándar residual del modelo es \(\hat{\sigma} = 209.32\). Este valor representa la desviación típica de los residuos, es decir, el error medio cometido por el modelo al predecir la demanda energética.
+
+```{r}
+summary(modelo_demanda)$sigma
+```
+
+El error estándar residual del modelo es moderado en relación con el nivel medio de demanda energética, lo que sugiere una capacidad predictiva adecuada y un buen ajuste del modelo a los datos observados.
+
+El análisis de la varianza confirma que todas las variables explicativas contribuyen de forma significativa a la explicación de la demanda energética. La temperatura media y el consumo histórico concentran la mayor parte de la variabilidad explicada, mientras que las variables económicas aportan información adicional relevante, reforzando el carácter multivariante del modelo.
+
+```{r echo=TRUE}
+anova(modelo_demanda)
+```
+
+# Análisis de observaciones influyentes 
+
+Una vez seleccionado el modelo final, se analizó la posible presencia de observaciones atípicas o influyentes que pudieran afectar de forma desproporcionada a la estimación de los parámetros y a la capacidad predictiva del modelo. Este análisis es especialmente relevante en un contexto empresarial, ya que la toma de decisiones basada en el modelo requiere que sus resultados no dependan de unos pocos casos extremos.
+
+El diagnóstico se abordó desde distintas perspectivas complementarias. En primer lugar, se analizaron los residuos estudentizados eliminados, que permiten detectar observaciones con un comportamiento anómalo en la variable respuesta teniendo en cuenta el efecto de su eliminación sobre el ajuste. Este enfoque incorpora un contraste formal corregido por multiplicidad mediante el criterio de Bonferroni, garantizando el control del error tipo I. Los resultados obtenidos indican que ninguna observación supera el umbral crítico, por lo que no se identifican valores atípicos relevantes en la respuesta.
+
+```{r echo=TRUE, include=FALSE}
+stud.del.resids=rstudent(modelo_demanda) 
+ols_plot_resid_stud_fit(modelo_demanda) # mal
+alpha <- 0.005
+n <- nrow(df_demanda)
+p <- length(coef(modelo_demanda)) - 1
+stud_del_resids <- rstudent(modelo_demanda)
+# Cuantil crítico con corrección de Bonferroni
+cuantil <- qt(1 - alpha / (2 * n), df = n - p - 1)
+plot(abs(stud.del.resids),ylim=c(0,10))
+abline(h=qt(1-alpha/(2*n),df=n-p-1))
+abline(h=qt(1-alpha/(2*n),df=n-p-1))
+```
+
+```{r, echo=FALSE}
+plot(abs(stud.del.resids),ylim=c(0,10))
+abline(h=qt(1-alpha/(2*n),df=n-p-1))
+abline(h=qt(1-alpha/(2*n),df=n-p-1))
+```
+
+
+En segundo lugar, se evaluó el leverage de las observaciones, con el objetivo de identificar combinaciones poco habituales de las variables explicativas. 
+
+```{r,include=FALSE}
+leva <- hatvalues(modelo_demanda)
+ols_plot_resid_lev(modelo_demanda)
+2*p/n # bien graficado 
+leverage.falla=leva>2*p/n
+which.max(leva)
+```
+
+```{r,echo=FALSE}
+ols_plot_resid_lev(modelo_demanda)
+```
+
+Este análisis permitió detectar algunas observaciones con valores de apalancamiento elevados, destacando especialmente una observación situada en un extremo del rango del gasto del consumidor. Sin embargo, un leverage elevado no implica por sí mismo influencia sobre el modelo, sino únicamente una posición extrema en el espacio de covariables.
+
+```{r,echo=FALSE}
+plot(df_demanda$gasto_consumidor, df_demanda$demanda_energia,
+     main="Gasto vs Demanda", xlab="Gasto (€)", ylab="Demanda (kWh)",
+     pch = 16, cex = 0.7)
+i_max <- which.max(leva)
+text(df_demanda$gasto_consumidor[i_max], df_demanda$demanda_energia[i_max],
+     labels = i_max, pos = 3, cex = 0.9)
+```
+
+Para evaluar la influencia real de estas observaciones, se emplearon medidas globales y específicas de influencia. El estadístico DFFITS permitió analizar el impacto de eliminar una observación sobre su propia predicción, mientras que la distancia de Cook cuantificó el efecto conjunto sobre los coeficientes y las predicciones del modelo. Asimismo, el análisis mediante DFBETAS evaluó la sensibilidad de cada coeficiente individual a la eliminación de observaciones concretas. En todos los casos, los valores obtenidos se mantuvieron por debajo de los umbrales de referencia, lo que indica que ninguna observación ejerce una influencia excesiva sobre el ajuste ni compromete la estabilidad de los coeficientes estimados.
+
+```{r,include=FALSE}
+dffits(modelo_demanda) 
+ols_plot_dffits(modelo_demanda) 
+#Veo que para n grande esta bien definida 2*sqrt(p/n) 
+```
+
+```{r, include=FALSE}
+dist.cook= cooks.distance(modelo_demanda) 
+ols_plot_cooksd_chart(modelo_demanda)  
+umbral =qf(0.50,p,n-p)
+umbral
+#umbral2=qf(0.20,p,n-p) 
+influyentes =dist.cook>umbral
+plot(abs(dist.cook),ylim=c(0,1))
+abline(h=qf(0.50,p,n-p))
+#Con la correccion de Bonferroni:
+abline(h=qf(0.20,p,n-p))
+```
+
+```{r,echo=FALSE}
+op <- par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+
+n <- nrow(df_demanda)
+p <- length(coef(modelo_demanda)) - 1
+
+# 1) |DFFITS|
+plot(abs(dffits(modelo_demanda)), type="h", ylim=c(0,2),
+     main="|DFFITS|", xlab="Observación", ylab="|DFFITS|")
+abline(h = 1, lty = 2)
+
+# 2) Cook's distance
+dist.cook <- cooks.distance(modelo_demanda)
+plot(abs(dist.cook), type="h", ylim=c(0,1),
+     main="Distancia de Cook", xlab="Observación", ylab="D")
+
+abline(h = qf(0.50, p, n-p), lty = 2)  # umbral 0.50
+abline(h = qf(0.20, p, n-p), lty = 3)  # umbral 0.20
+
+par(op)
+```
+
+```{r, include=FALSE}
+dfb <- dfbetas(modelo_demanda)
+ols_plot_dfbetas(modelo_demanda) 
+#para bancos de datos grandes
+#esta bien definida
+#2/sqrt(n) 
+#abs(dfbetas(modelo_demanda))>1
+```
+
+# Diagnóstico de colinealidad y estabilidad del modelo
+
+Con el fin de garantizar la estabilidad de las estimaciones y la fiabilidad del modelo en un contexto empresarial, se evaluó la posible presencia de multicolinealidad entre las variables explicativas seleccionadas. La multicolinealidad puede provocar coeficientes inestables y dificultar la interpretación económica de los resultados, por lo que su diagnóstico resulta clave antes de utilizar el modelo con fines predictivos o de planificación.
+
+El análisis se abordó desde varios enfoques complementarios. En primer lugar, el estudio de los valores propios de la matriz \(X^TX\) no mostró valores cercanos a cero, lo que indica que no existen combinaciones lineales casi exactas entre las covariables y que la matriz de diseño está bien condicionada. Aunque se observa una diferencia de escala entre los valores propios, este comportamiento es habitual cuando las variables representan magnitudes de distinta naturaleza y no implica colinealidad problemática.
+
+```{r, echo=FALSE}
+X <- model.matrix(modelo_demanda)
+XtX <- t(X) %*% X
+eig_vals <- eigen(XtX)$values
+eig_vals
+```
+
+En segundo lugar, el diagnóstico mediante Factores de Inflación de la Varianza (VIF) confirma la ausencia de colinealidad relevante. Todos los valores de VIF obtenidos son muy cercanos a 1, lo que indica que cada variable aporta información propia y no redundante al modelo. En particular, ninguno de los predictores presenta valores que sugieran inflación de la varianza de los coeficientes o dependencia excesiva con el resto de covariables.
+
+```{r, include=FALSE}
+vif(modelo_demanda)
+```
+
+| Variable              | VIF |
+|-----------------------|-----|
+| temperatura_media     | 1.016 |
+| gasto_consumidor      | 1.037 |
+| desempleo             | 1.043 |
+| consumo_historico     | 1.048 |
+
+Como complemento visual, los gráficos de variables añadidas (added variable plots) refuerzan estas conclusiones. En particular, el gráfico correspondiente a la temperatura media muestra una relación lineal clara y negativa con la demanda energética incluso tras controlar el efecto del resto de variables. Este resultado confirma que la temperatura media mantiene una influencia estructural y no redundante dentro del modelo, validando tanto su inclusión como la especificación lineal adoptada.
+
+```{r}
+avPlots(modelo_demanda,~temperatura_media) #added variable
+```
+
+# Diagnóstico del modelo
+
+El uso de un modelo de regresión lineal múltiple implica asumir que la relación entre la demanda energética y las variables explicativas puede aproximarse adecuadamente mediante una combinación lineal de estas. Para garantizar la validez de las inferencias y la fiabilidad del modelo en un contexto empresarial, se verifican a continuación los principales supuestos del modelo mediante un análisis gráfico conjunto y contrastes complementarios.
+
+```{r, echo=FALSE, results="hide", fig.show="asis", fig.width=7, fig.height=7}
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+
+plot(modelo_demanda, which = 1)  #Residuos vs Ajustados
+plot(modelo_demanda, which = 2)  # QQ-plot
+plot(modelo_demanda, which = 3)  # Scale-Location
+plot(modelo_demanda, which = 5)  # Residuos vs Leverage
+
+par(mfrow = c(1, 1))
+```
+
+En primer lugar, el gráfico de residuos frente a valores ajustados no muestra patrones sistemáticos ni curvaturas pronunciadas, lo que respalda la hipótesis de linealidad entre la demanda energética y las variables explicativas. Los residuos se distribuyen de forma aproximadamente aleatoria alrededor del valor cero, lo que indica además la ausencia de sesgo sistemático en las predicciones.
+
+Este resultado se ve reforzado por el test de Harvey–Collier, que no detecta desviaciones significativas respecto a la especificación lineal del modelo, confirmando la adecuación funcional desde un punto de vista estadístico.
+
+```{r}
+hc_test <- harvtest(modelo_demanda)
+print(hc_test)
+```
+
+El gráfico Scale–Location no evidencia un incremento progresivo de la dispersión de los residuos a lo largo del rango de valores ajustados, lo que sugiere que la varianza de los errores puede considerarse aproximadamente constante. Desde una perspectiva empresarial, este comportamiento implica una precisión relativamente homogénea de las predicciones para distintos niveles de demanda energética.
+
+El QQ-plot de los residuos estudentizados muestra una alineación clara con la recta teórica de normalidad, con ligeras desviaciones en los extremos, habituales en muestras de tamaño moderado. Este resultado es coherente con la evidencia proporcionada por el contraste de Shapiro–Wilk, que no rechaza la hipótesis de normalidad a niveles habituales de significación. En consecuencia, el supuesto de normalidad de los errores puede considerarse razonablemente satisfecho.
+
+```{r echo=TRUE}
+shapiro.test(modelo_demanda$residuals)
+```
+
+En cuanto a la independencia de los errores, los datos analizados no presentan una estructura temporal explícita ni una secuencia natural en el tiempo, por lo que no se espera la presencia de autocorrelación. Una inspección gráfica ilustrativa de los residuos en función del orden de observación no muestra patrones sistemáticos ni tendencias, lo que respalda este supuesto.
+
+```{r}
+# Representación gráfica ilustrativa de residuos en función del orden
+ts.plot(modelo_demanda$residuals)
+```
+
+En conjunto, el análisis de diagnóstico confirma que el modelo cumple razonablemente los supuestos fundamentales de la regresión lineal múltiple. Desde un punto de vista empresarial, estos resultados refuerzan la robustez, estabilidad e interpretabilidad del modelo, validando su uso como herramienta de apoyo a la planificación, previsión y análisis de escenarios en el ámbito de la demanda energética.
+
+# Regularización del modelo
+
+La regularización es una técnica habitual en modelos de regresión cuyo objetivo es controlar la complejidad del modelo, reducir la varianza de las estimaciones y mitigar posibles problemas de sobreajuste mediante la introducción de penalizaciones sobre los coeficientes. No obstante, su aplicación resulta pertinente principalmente en contextos caracterizados por un elevado número de predictores, multicolinealidad significativa o inestabilidad en las estimaciones.
+
+En el presente estudio, el modelo seleccionado presenta un conjunto de características que, a priori, reducen la necesidad de regularización: incluye un número reducido de variables explicativas, muestra coeficientes estadísticamente significativos y estables, presenta valores bajos de los factores de inflación de la varianza (VIF), ofrece un buen comportamiento en validación cruzada y cumple razonablemente los supuestos del modelo lineal. Aun así, y con el objetivo de responder de forma rigurosa a la cuestión planteada, se evalúa empíricamente la conveniencia de las principales técnicas de regularización.
+
+## Ridge Regression
+
+La regresión Ridge introduce una penalización de tipo \(L_2\), basada en la suma de los cuadrados de los coeficientes del modelo. Esta técnica resulta especialmente útil en presencia de multicolinealidad o cuando el modelo presenta inestabilidad en las estimaciones.
+
+La función objetivo de Ridge es:
+
+\[
+\min_{\beta} \left\{ \sum_{i=1}^{n} (y_i - X_i\beta)^2 + \lambda \sum_{j=1}^{p} \beta_j^2 \right\}
+\]
+
+Esta penalización no elimina variables del modelo, sino que reduce la magnitud de los coeficientes, favoreciendo modelos más estables.
+
+```{r}
+X <- model.matrix(demanda_energia ~ temperatura_media + gasto_consumidor +
+  desempleo + consumo_historico, data = df_demanda)[, -1]   # quitar intercepto
+y <- df_demanda$demanda_energia
+set.seed(123)
+cv_ridge <- cv.glmnet(
+  x = X,
+  y = y,
+  alpha = 0,        
+  nfolds = 5,
+  standardize = TRUE
+)
+plot(cv_ridge)
+coef(cv_ridge, s = "lambda.min")
+```
+
+```{r}
+min(cv_ridge$cvm)
+mean(residuals(modelo_demanda)^2)
+```
+
+La aplicación de Ridge mediante validación cruzada no mejora el rendimiento predictivo del modelo respecto a la regresión lineal clásica. El error cuadrático medio obtenido es superior al del modelo sin regularización, lo que indica que la penalización introduce un sesgo adicional que no se compensa con una reducción relevante de la varianza. Este resultado es coherente con la ausencia de multicolinealidad y la estabilidad observada en el modelo original. En consecuencia, la regularización mediante Ridge no resulta adecuada en este contexto.
+
+
+## Lasso
+
+La regresión Lasso introduce una penalización de tipo \(L_1\), basada en la suma de los valores absolutos de los coeficientes. Su principal ventaja es que puede forzar algunos coeficientes a ser exactamente cero, realizando selección automática de variables.
+
+La función objetivo de Lasso es:
+
+\[
+\min_{\beta} \left\{ \sum_{i=1}^{n} (y_i - X_i\beta)^2 + \lambda \sum_{j=1}^{p} |\beta_j| \right\}
+\]
+
+En este estudio, el proceso de selección de variables ha sido exhaustivo y consistente, combinando búsqueda exhaustiva, selección paso a paso y validación cruzada. El modelo final incluye únicamente variables relevantes y estadísticamente significativas. En este contexto, no se espera que Lasso elimine variables adicionales sin pérdida de capacidad explicativa, por lo que su aplicación no aportaría una mejora sustancial y podría incluso reducir la interpretabilidad del modelo.
+
+## Elastic Net
+
+Elastic Net combina las penalizaciones de Ridge y Lasso, siendo especialmente útil cuando existen grupos de variables altamente correlacionadas o cuando el número de predictores es elevado.
+
+Su función objetivo es:
+
+\[
+\min_{\beta} \left\{ \sum_{i=1}^{n} (y_i - X_i\beta)^2
++ \lambda \left[ \alpha \sum_{j=1}^{p} |\beta_j|
++ (1-\alpha) \sum_{j=1}^{p} \beta_j^2 \right] \right\}
+\]
+
+En el presente análisis no se identifican grupos de variables altamente correlacionadas ni un número elevado de covariables. En consecuencia, Elastic Net no resulta necesario y su aplicación introduciría complejidad adicional sin una ganancia clara en términos de ajuste, estabilidad o interpretabilidad.
+
+| Aspecto                            | Regresión lineal (modelo seleccionado) | Modelos con regularización (Ridge / Lasso / Elastic Net) |
+| ---------------------------------- | -------------------------------------- | -------------------------------------------------------- |
+| Nº de variables                    | 4                                      | 4 (Ridge / Elastic Net) <br> ≤ 4 (Lasso)                 |
+| Multicolinealidad                  | No significativa (VIF ≈ 1)             | Controlada mediante penalización                         |
+| Estabilidad de coeficientes        | Alta                                   | Alta, pero con mayor sesgo                               |
+| Interpretabilidad                  | Alta (coeficientes directos)           | Menor (coeficientes penalizados)                         |
+| Selección de variables             | Previa y justificada                   | Automática (solo Lasso)                                  |
+| Rendimiento predictivo (CV)        | Mejor o equivalente                    | No mejora respecto al modelo base                        |
+| Riesgo de sobreajuste              | Bajo                                   | Bajo                                                     |
+| Complejidad del modelo             | Moderada                               | Mayor (hiperparámetro (\lambda))                         |
+| Adecuación al contexto empresarial | Alta                                   | Limitada                                                 |
+
+A la vista del análisis realizado, no se considera necesaria la regularización del modelo seleccionado. La regresión lineal múltiple presenta un buen ajuste global, estabilidad en los coeficientes, ausencia de multicolinealidad y un rendimiento predictivo superior o equivalente al de los modelos regularizados evaluados.
+
+Desde una perspectiva empresarial, mantener el modelo sin regularización permite conservar una alta interpretabilidad de los coeficientes y facilita su uso en tareas de planificación, previsión y análisis de escenarios. No obstante, técnicas como Ridge, Lasso o Elastic Net podrían resultar relevantes en escenarios futuros caracterizados por un mayor número de variables, mayor colinealidad o un riesgo más elevado de sobreajuste.
+
+# Modelo con interacción
+
+Con el objetivo de evaluar si una especificación más flexible mejora la explicación de la demanda energética, se ajustó un modelo alternativo que incorpora una interacción entre la temperatura media y el consumo histórico. Esta interacción permite analizar si el efecto de la temperatura sobre la demanda depende del nivel previo de consumo energético.
+
+```{r}
+mod_int <- lm(
+  demanda_energia ~ temperatura_media * consumo_historico + gasto_consumidor + desempleo,
+  data = df_demanda)
+# summary(mod_int)
+```
+
+Para comparar el modelo con interacción frente al modelo lineal seleccionado, se utilizaron los criterios de información AIC y BIC, que permiten evaluar el equilibrio entre calidad de ajuste y complejidad del modelo penalizando la inclusión de términos adicionales.
+
+```{r}
+AIC(modelo_demanda, mod_int)
+BIC(modelo_demanda, mod_int)
+```
+
+
+Los resultados obtenidos muestran que tanto el AIC como el BIC son menores en el modelo lineal sin interacción, lo que indica un mejor compromiso entre ajuste y parsimonia. Aunque el modelo con interacción introduce una mayor flexibilidad al permitir efectos conjuntos entre variables, esta ganancia potencial no compensa el incremento en complejidad asociado al término adicional.
+
+En consecuencia, la inclusión del término de interacción no aporta una mejora relevante en términos de ajuste ni de capacidad explicativa. Desde un punto de vista interpretativo, este resultado sugiere que los efectos de la temperatura media y del consumo histórico sobre la demanda energética quedan adecuadamente capturados de forma aditiva, sin necesidad de modelar interacciones entre ambas variables.
+
+# Material complementario y conclusiones
+
+La predicción de la demanda energética es un elemento clave para la planificación y la toma de decisiones en el sector energético. En este trabajo se ha desarrollado un diagnóstico completo de un modelo predictivo, evaluando su comportamiento estadístico, su capacidad explicativa y su aplicabilidad en un contexto empresarial.
+
+Los resultados muestran que un modelo de regresión lineal múltiple, basado en un número reducido de variables climáticas, económicas y de consumo, ofrece un equilibrio adecuado entre capacidad predictiva, estabilidad e interpretabilidad. Las alternativas de mayor complejidad analizadas, como la regularización y la inclusión de interacciones, no aportan mejoras relevantes, por lo que se mantiene una especificación parsimoniosa como modelo final.
+
+Como complemento al análisis, se ha desarrollado una aplicación interactiva en Shiny que permite explorar de forma dinámica los datos y los resultados del modelo, facilitando su comprensión y su posible uso operativo en tareas de planificación y previsión.
+
+**Dashboard Shiny:** \href{https://salmagsdata.shinyapps.io/demanda-energetica/}{Abrir dashboard interactivo}
+
+
+
